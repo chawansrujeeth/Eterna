@@ -1,21 +1,25 @@
 import type { FastifyRequest } from 'fastify';
-import type { SocketStream } from '@fastify/websocket';
+import type { Duplex } from 'node:stream';
 import type WebSocket from 'ws';
 import { subscribeOrderEvents } from '../lib/pubsub';
 import { logger } from '../lib/logger';
 import { prisma } from '../lib/db';
 
-type MaybeSocketStream = SocketStream & { socket?: WebSocket };
+type SocketStream = Duplex & { socket: WebSocket };
+type MaybeSocketStream = Duplex & { socket?: WebSocket };
 
-const getSocket = (connection: MaybeSocketStream): WebSocket => {
-  if (connection.socket) {
+const isSocketStream = (connection: MaybeSocketStream | WebSocket): connection is SocketStream =>
+  typeof (connection as MaybeSocketStream).socket !== 'undefined';
+
+const getSocket = (connection: MaybeSocketStream | WebSocket): WebSocket => {
+  if (isSocketStream(connection)) {
     return connection.socket;
   }
   return connection as unknown as WebSocket;
 };
 
-export async function handleOrderWebSocket(connection: SocketStream, req: FastifyRequest) {
-  const ws = getSocket(connection as MaybeSocketStream);
+export async function handleOrderWebSocket(connection: MaybeSocketStream | WebSocket, req: FastifyRequest) {
+  const ws = getSocket(connection);
   const url = new URL(req.url, 'http://localhost'); // base ignored
   const orderId = url.searchParams.get('orderId');
   if (!orderId) {

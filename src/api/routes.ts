@@ -7,6 +7,48 @@ import { handleOrderWebSocket } from './ws';
 import { randomUUID } from 'node:crypto';
 import { CONFIG } from '../config';
 import { allowOrderCreate } from '../lib/rate';
+import { getOrSetIdempotency } from '../lib/idempotency';
+
+const CreateOrderSchema = {
+  type: 'object',
+  required: ['orderType', 'tokenIn', 'tokenOut', 'amount'],
+  properties: {
+    orderType: { type: 'string', enum: ['market'] },
+    tokenIn: { type: 'string', example: 'SOL' },
+    tokenOut: { type: 'string', example: 'USDC' },
+    amount: { type: 'number', example: 1.25, minimum: 0.0000001 },
+    slippageBps: { type: 'integer', minimum: 1, maximum: 10000, example: 50 },
+  },
+  additionalProperties: false,
+} as const;
+
+const CreateOrderResponse = {
+  200: {
+    description: 'Order accepted',
+    type: 'object',
+    properties: {
+      orderId: { type: 'string', example: 'cuid_or_uuid' },
+      idempotent: { type: 'boolean', example: false },
+    },
+  },
+  400: {
+    description: 'Invalid body',
+    type: 'object',
+    properties: {
+      error: { type: 'string', example: 'invalid_body' },
+      details: { type: 'array' },
+    },
+  },
+  429: {
+    description: 'Rate limited',
+    type: 'object',
+    properties: {
+      error: { type: 'string', example: 'rate_limited' },
+      message: { type: 'string' },
+      currentCount: { type: 'number' },
+    },
+  },
+} as const;
 
 const bodySchema = z.object({
   orderType: z.literal('market'),
@@ -23,12 +65,23 @@ export async function registerRoutes(app: FastifyInstance) {
   });
 
   // HTTP submit endpoint (POST)
-  app.post('/api/orders/execute', async (req, reply) => {
-    const parsed = bodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid_body', details: parsed.error.errors });
-    }
-    const body = parsed.data;
+  app.post(
+    '/api/orders/execute',
+    {
+      schema: {
+        tags: ['orders'],
+        summary: 'Create & execute a market order',
+        description: 'Submit a market order. Use WebSocket GET /api/orders/execute?orderId=... to stream status.',
+        body: CreateOrderSchema,
+        response: CreateOrderResponse,
+      },
+    },
+    async (req, reply) => {
+      const parsed = bodySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_body', details: parsed.error.issues });
+      }
+      const body = parsed.data;
     const gate = await allowOrderCreate();
     if (!gate.allowed) {
       return reply
@@ -36,6 +89,15 @@ export async function registerRoutes(app: FastifyInstance) {
         .send({ error: 'rate_limited', message: `API limit ${gate.limit}/min exceeded`, currentCount: gate.count });
     }
     const slippageBps = body.slippageBps ?? CONFIG.DEFAULT_SLIPPAGE_BPS;
+    const idemKey = String(req.headers['x-idempotency-key'] || '');
+    if (idemKey) {
+      const existing = await getOrSetIdempotency(idemKey);
+      if (existing) {
+        // Re-emit pending so the client WS still sees something if they reconnect
+        await publishOrderEvent({ orderId: existing, status: 'pending' });
+        return reply.code(200).send({ orderId: existing, idempotent: true });
+      }
+    }
 
     // create order row
     const orderId = randomUUID();
@@ -50,6 +112,9 @@ export async function registerRoutes(app: FastifyInstance) {
         status: 'pending',
       },
     });
+    if (idemKey) {
+      await getOrSetIdempotency(idemKey, orderId);
+    }
 
     // enqueue job for worker
     await ordersQueue.add('execute', {
@@ -75,5 +140,6 @@ export async function registerRoutes(app: FastifyInstance) {
 
     // return orderId to client
     return reply.code(200).send({ orderId });
-  });
+    }
+  );
 }
