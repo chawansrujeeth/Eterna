@@ -1,64 +1,64 @@
 import type { FastifyRequest } from 'fastify';
+import type { SocketStream } from '@fastify/websocket';
 import type WebSocket from 'ws';
-import { orderBus } from '../lib/bus';
+import { subscribeOrderEvents } from '../lib/pubsub';
 import { logger } from '../lib/logger';
+import { prisma } from '../lib/db';
 
-type SocketLike = WebSocket & { socket?: WebSocket };
+type MaybeSocketStream = SocketStream & { socket?: WebSocket };
 
-const getSocket = (connection: SocketLike): WebSocket => {
+const getSocket = (connection: MaybeSocketStream): WebSocket => {
   if (connection.socket) {
     return connection.socket;
   }
-  return connection;
+  return connection as unknown as WebSocket;
 };
 
-export function handleOrderWebSocket(connection: SocketLike, req: FastifyRequest) {
-  const ws = getSocket(connection);
+export async function handleOrderWebSocket(connection: SocketStream, req: FastifyRequest) {
+  const ws = getSocket(connection as MaybeSocketStream);
   const url = new URL(req.url, 'http://localhost'); // base ignored
   const orderId = url.searchParams.get('orderId');
-
-  const safeSend = (payload: unknown, context: string) => {
-    if (ws.readyState !== ws.OPEN) {
-      logger.warn({ orderId, context, readyState: ws.readyState }, 'WS not open, skipping send');
-      return;
-    }
-    try {
-      ws.send(JSON.stringify(payload), (err) => {
-        if (err) {
-          logger.error({ err, orderId, context }, 'WS send failed');
-        }
-      });
-    } catch (err) {
-      logger.error({ err, orderId, context }, 'WS send threw');
-    }
-  };
-
   if (!orderId) {
-    safeSend({ error: 'orderId query param required' }, 'missing_order_id');
+    ws.send(JSON.stringify({ error: 'orderId query param required' }));
     ws.close();
     return;
   }
 
-  const unsubscribe = orderBus.subscribe(orderId, (evt) => {
-    safeSend(evt, 'order_event');
-  });
-
-  ws.on('close', () => {
-    unsubscribe();
-  });
-
-  ws.on('error', (err) => {
-    logger.error({ err, orderId }, 'WS socket error');
-  });
-
-  const sendAck = () => {
-    logger.info({ orderId }, 'WS order stream connected');
-    safeSend({ orderId, status: 'ws_connected', ts: Date.now() }, 'ws_connected');
+  const sendSafe = (payload: unknown) => {
+    try {
+      ws.send(JSON.stringify(payload));
+    } catch (e) {
+      logger.error({ e }, 'WS send failed');
+    }
   };
 
-  if (ws.readyState === ws.OPEN) {
-    queueMicrotask(sendAck);
-  } else {
-    ws.once('open', sendAck);
+  sendSafe({ orderId, status: 'ws_connected', ts: Date.now() });
+
+  const history = await prisma.orderEvent.findMany({
+    where: { orderId },
+    orderBy: { createdAt: 'asc' },
+  });
+  for (const evt of history) {
+    sendSafe({
+      orderId: evt.orderId,
+      status: evt.status,
+      payload: evt.payload ?? undefined,
+      ts: evt.createdAt.getTime(),
+      replay: true,
+    });
   }
+
+  const unsubscribe = await subscribeOrderEvents(orderId, (evt) => {
+    sendSafe(evt);
+  });
+
+  ws.on('close', async () => {
+    try {
+      await unsubscribe();
+    } catch {
+      /* ignore */
+    }
+  });
+
+  // ws_connected already sent before history replay
 }

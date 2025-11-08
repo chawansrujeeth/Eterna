@@ -1,17 +1,19 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '../lib/db';
-import { orderBus } from '../lib/bus';
 import { ordersQueue } from '../lib/queue';
+import { publishOrderEvent } from '../lib/pubsub';
 import { handleOrderWebSocket } from './ws';
 import { randomUUID } from 'node:crypto';
+import { CONFIG } from '../config';
+import { allowOrderCreate } from '../lib/rate';
 
 const bodySchema = z.object({
   orderType: z.literal('market'),
   tokenIn: z.string().min(1),
   tokenOut: z.string().min(1),
   amount: z.number().positive(),
-  slippageBps: z.number().int().min(1).max(10_000).default(50),
+  slippageBps: z.number().int().min(1).max(10_000).optional(),
 });
 
 export async function registerRoutes(app: FastifyInstance) {
@@ -27,6 +29,13 @@ export async function registerRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'invalid_body', details: parsed.error.errors });
     }
     const body = parsed.data;
+    const gate = await allowOrderCreate();
+    if (!gate.allowed) {
+      return reply
+        .code(429)
+        .send({ error: 'rate_limited', message: `API limit ${gate.limit}/min exceeded`, currentCount: gate.count });
+    }
+    const slippageBps = body.slippageBps ?? CONFIG.DEFAULT_SLIPPAGE_BPS;
 
     // create order row
     const orderId = randomUUID();
@@ -37,7 +46,7 @@ export async function registerRoutes(app: FastifyInstance) {
         tokenIn: body.tokenIn,
         tokenOut: body.tokenOut,
         amount: body.amount,
-        slippageBps: body.slippageBps,
+        slippageBps,
         status: 'pending',
       },
     });
@@ -48,12 +57,12 @@ export async function registerRoutes(app: FastifyInstance) {
       tokenIn: body.tokenIn,
       tokenOut: body.tokenOut,
       amount: body.amount,
-      slippageBps: body.slippageBps,
+      slippageBps,
       orderType: body.orderType,
     });
 
     // emit first event
-    orderBus.publish(orderId, { orderId, status: 'pending', ts: Date.now() });
+    await publishOrderEvent({ orderId, status: 'pending' });
 
     // Persist the event row (nice to have)
     await prisma.orderEvent.create({

@@ -1,0 +1,40 @@
+{
+  "_type": "export",
+  "__export_format": 4,
+  "__export_date": "2025-11-08T00:00:00.000Z",
+  "__export_source": "insomnia.desktop.app:v2025.0",
+  "resources": [
+    {
+      "_id": "wrk_order_engine",
+      "_type": "workspace",
+      "name": "Order Engine"
+    },
+    {
+      "_id": "env_base",
+      "_type": "environment",
+      "parentId": "wrk_order_engine",
+      "name": "Base Environment",
+      "data": { "baseUrl": "http://localhost:3000", "wsBase": "ws://localhost:3000", "orderId": "" }
+    },
+    {
+      "_id": "req_http_create",
+      "_type": "request",
+      "parentId": "wrk_order_engine",
+      "name": "POST /api/orders/execute",
+      "method": "POST",
+      "url": "{{ baseUrl }}/api/orders/execute",
+      "body": {
+        "mimeType": "application/json",
+        "text": "{\n  \"orderType\": \"market\",\n  \"tokenIn\": \"SOL\",\n  \"tokenOut\": \"USDC\",\n  \"amount\": 1.25,\n  \"slippageBps\": 50\n}"
+      }
+    },
+    {
+      "_id": "req_ws_stream",
+      "_type": "websocket_request",
+      "parentId": "wrk_order_engine",
+      "name": "WS /api/orders/execute?orderId={{ orderId }}",
+      "url": "{{ wsBase }}/api/orders/execute?orderId={{ orderId }}",
+      "metaSortKey": -1
+    }
+  ]
+}

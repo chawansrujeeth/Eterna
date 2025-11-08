@@ -1,9 +1,8 @@
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
+import { CONFIG } from '../config';
 
-const connection = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379', {
-  maxRetriesPerRequest: null,
-});
+const connection = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379');
 
 export const ordersQueue = new Queue('orders', {
   connection,
@@ -12,5 +11,9 @@ export const ordersQueue = new Queue('orders', {
     backoff: { type: 'exponential', delay: 500 },
     removeOnComplete: true,
     removeOnFail: false,
+  },
+  limiter: {
+    max: CONFIG.QUEUE_MAX_PER_MIN,
+    duration: 60_000,
   },
 });

@@ -1,0 +1,47 @@
+{
+  "info": {
+    "name": "Order Engine",
+    "_postman_id": "4f2a0c1a-0000-4444-8888-aaaaaaaaaaaa",
+    "description": "POST to create order; use Insomnia or tools/ws-client to open WS.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Create Market Order",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "url": { "raw": "{{baseUrl}}/api/orders/execute", "host": ["{{baseUrl}}"], "path": ["api", "orders", "execute"] },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"orderType\":\"market\",\n  \"tokenIn\":\"SOL\",\n  \"tokenOut\":\"USDC\",\n  \"amount\": 1.25,\n  \"slippageBps\": 50\n}"
+        },
+        "description": "Creates an order and returns { orderId }.\nOpen WS at ws://<host>/api/orders/execute?orderId=<id>."
+      },
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "const json = pm.response.json();",
+              "if (json.orderId) {",
+              "  pm.environment.set('orderId', json.orderId);",
+              "  console.log('orderId set in env:', json.orderId);",
+              "} else {",
+              "  console.warn('No orderId in response');",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000" },
+    { "key": "orderId", "value": "" }
+  ]
+}

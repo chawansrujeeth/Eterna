@@ -11,7 +11,9 @@
     "test": "jest --runInBand",
     "lint": "echo \"(optional)\"",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev --name init"
+    "prisma:migrate": "prisma migrate dev --name init",
+    "ws": "tsx tools/ws-client.ts",
+    "ws:node": "node tools/ws-client.js"
   },
   "keywords": [],
   "author": "",
@@ -30,6 +32,7 @@
     "pino-pretty": "^13.1.2",
     "prisma": "^6.19.0",
     "uuid": "^13.0.0",
+    "ws": "^8.18.3",
     "zod": "^4.1.12"
   },
   "devDependencies": {
