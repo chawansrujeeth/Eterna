@@ -142,13 +142,78 @@ describe('worker handler', () => {
     expect(statuses).toEqual(['routing', 'building', 'submitted', 'confirmed']);
   });
 
+  test('load test: 15 orders reach terminal states', async () => {
+    const router = {
+      getRaydiumQuote: jest.fn().mockResolvedValue({ dex: 'Raydium', price: 100, fee: 0.003 }),
+      getMeteoraQuote: jest.fn().mockResolvedValue({ dex: 'Meteora', price: 99.5, fee: 0.003 }),
+      generateMockTxHash: jest.fn().mockReturnValue('0xbulk'),
+      simulateExecution: jest.fn().mockResolvedValue({ executedPrice: 100 }),
+    };
+
+    const handler = createHandler(router as any);
+    const orderIds = Array.from({ length: 15 }, (_, idx) => `order-batch-${idx + 1}`);
+    const jobs = orderIds.map((orderId, idx) => ({
+      data: { ...baseJob, orderId, amount: baseJob.amount + idx * 0.1 },
+    }));
+
+    await Promise.all(jobs.map((job) => handler(job as any)));
+
+    expect(router.getRaydiumQuote).toHaveBeenCalledTimes(orderIds.length);
+    expect(router.getMeteoraQuote).toHaveBeenCalledTimes(orderIds.length);
+    expect(router.simulateExecution).toHaveBeenCalledTimes(orderIds.length);
+
+    const publishMock = jest.mocked(publishOrderEvent);
+    const statusesByOrder = new Map<string, string[]>();
+    for (const [evt] of publishMock.mock.calls) {
+      if (!evt?.orderId) continue;
+      const list = statusesByOrder.get(evt.orderId) ?? [];
+      list.push(evt.status);
+      statusesByOrder.set(evt.orderId, list);
+    }
+    expect(statusesByOrder.size).toBe(orderIds.length);
+    for (const id of orderIds) {
+      const statuses = statusesByOrder.get(id) ?? [];
+      const terminal = [...statuses].reverse().find((s) => s === 'confirmed' || s === 'failed');
+      expect(terminal).toBe('confirmed');
+    }
+
+    const prismaMock = prisma as any;
+    const confirmedUpdates = (prismaMock.order.update as jest.Mock).mock.calls.filter(
+      ([args]: any) => args?.data?.status === 'confirmed',
+    );
+    expect(confirmedUpdates).toHaveLength(orderIds.length);
+  });
+
+  test('wrapped SOL branch emits pending detail', async () => {
+    const router = {
+      getRaydiumQuote: jest.fn().mockResolvedValue({ dex: 'Raydium', price: 101, fee: 0.002 }),
+      getMeteoraQuote: jest.fn().mockResolvedValue({ dex: 'Meteora', price: 100, fee: 0.003 }),
+      generateMockTxHash: jest.fn().mockReturnValue('0xwrap'),
+      simulateExecution: jest.fn().mockResolvedValue({ executedPrice: 101 }),
+    };
+
+    const handler = createHandler(router as any);
+    const job: any = { data: { ...baseJob, orderId: 'order-sol', tokenIn: 'SOL', tokenOut: 'USDC' } };
+
+    await expect(handler(job)).resolves.toBe(true);
+
+    const publishMock = jest.mocked(publishOrderEvent);
+    expect(publishMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orderId: 'order-sol',
+        status: 'pending',
+        detail: { wrappedSol: true },
+      }),
+    );
+  });
+
   test('retry stops at 3 and final status is failed', async () => {
     const worker = startWorker({ connection: {} as any, handler: jest.fn() as any });
     const failedHandler = (worker as any).handlers.failed as (job: any, err: Error) => Promise<void>;
     expect(typeof failedHandler).toBe('function');
 
     (prisma.order.findUnique as jest.Mock).mockResolvedValueOnce({ id: 'order-retry', status: 'submitted' });
-    const job = { data: { orderId: 'order-retry' }, attemptsMade: 3 } as any;
+    const job = { data: { orderId: 'order-retry' }, attemptsMade: 3, opts: { attempts: 3 } } as any;
     const err = new Error('boom');
 
     await failedHandler(job, err);
@@ -177,6 +242,43 @@ describe('worker handler', () => {
 
     const queueOpts = (ordersQueue as any).opts;
     expect(queueOpts.defaultJobOptions.attempts).toBe(3);
+  });
+
+  test('transient failures emit retrying events without marking the order failed', async () => {
+    const worker = startWorker({ connection: {} as any, handler: jest.fn() as any });
+    const failedHandler = (worker as any).handlers.failed as (job: any, err: Error) => Promise<void>;
+    const publishMock = jest.mocked(publishOrderEvent);
+
+    publishMock.mockClear();
+    (prisma.orderEvent.create as jest.Mock).mockClear();
+    (prisma.order.findUnique as jest.Mock).mockClear();
+    (prisma.order.update as jest.Mock).mockClear();
+
+    const job = { data: { orderId: 'order-retry' }, attemptsMade: 1, opts: { attempts: 3 } } as any;
+    const err = new Error('redis hiccup');
+
+    await failedHandler(job, err);
+
+    expect(publishMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        orderId: 'order-retry',
+        status: 'retrying',
+        error: 'redis hiccup',
+        attempt: 1,
+        remainingAttempts: 2,
+      }),
+    );
+    expect(prisma.orderEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          orderId: 'order-retry',
+          status: 'retrying',
+          payload: expect.objectContaining({ attempt: 1, remainingAttempts: 2 }),
+        }),
+      }),
+    );
+    expect(prisma.order.findUnique).not.toHaveBeenCalled();
+    expect(prisma.order.update).not.toHaveBeenCalled();
   });
 
   test('queue concurrency enforced (mock timers)', async () => {

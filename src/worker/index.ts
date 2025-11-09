@@ -21,7 +21,7 @@ type ExecuteData = {
   orderType: 'market';
 };
 
-class FatalOrderError extends Error {
+export class FatalOrderError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'FatalOrderError';
@@ -41,12 +41,26 @@ export function createHandler(router = new MockDexRouter()) {
     const out1 = amount * ray.price * (1 - ray.fee);
     const out2 = amount * met.price * (1 - met.fee);
     const best = out1 >= out2 ? ray : met;
+    const routingDecision = {
+      orderId,
+      tokenIn,
+      tokenOut,
+      amount,
+      slippageBps,
+      candidates: [
+        { dex: ray.dex, price: ray.price, fee: ray.fee, estimatedOut: out1 },
+        { dex: met.dex, price: met.price, fee: met.fee, estimatedOut: out2 },
+      ],
+      selected: { dex: best.dex, price: best.price, fee: best.fee, estimatedOut: Math.max(out1, out2) },
+    };
+    logger.info(routingDecision, 'DEX routing decision');
+    console.log('[dex-routing]', routingDecision);
     await prisma.order.update({ where: { id: orderId }, data: { routeDex: best.dex } });
 
     // 1.5) Mock wrapped SOL branch (no-op but testable)
     const needsWrap = tokenIn.toUpperCase() === 'SOL' && tokenOut.toUpperCase() !== 'SOL';
     if (needsWrap) {
-      await publishOrderEvent({ orderId, status: 'pending', detail: { wrappedSol: true }, ts: Date.now() });
+      await safePublishOrderEvent({ orderId, status: 'pending', detail: { wrappedSol: true }, ts: Date.now() });
     }
 
     // 2) BUILDING
@@ -75,7 +89,7 @@ export function createHandler(router = new MockDexRouter()) {
       where: { id: orderId },
       data: { executedPrice, amountOut: amountOutFinal, txHash, status: 'confirmed' },
     });
-    await publishOrderEvent({
+    await safePublishOrderEvent({
       orderId,
       status: 'confirmed',
       txHash,
@@ -98,6 +112,39 @@ export function createHandler(router = new MockDexRouter()) {
   };
 }
 
+async function safePublishOrderEvent(evt: Parameters<typeof publishOrderEvent>[0]) {
+  try {
+    await publishOrderEvent(evt);
+  } catch (err) {
+    logger.warn({ err, orderId: evt?.orderId }, 'Failed to publish order event');
+  }
+}
+
+async function recordRetryAttempt(payload: {
+  orderId: string;
+  attemptsMade: number;
+  maxAttempts: number;
+  error: Error | undefined;
+}) {
+  const retryPayload = {
+    error: payload.error?.message || 'UNKNOWN_ERROR',
+    attempt: payload.attemptsMade,
+    remainingAttempts: Math.max(payload.maxAttempts - payload.attemptsMade, 0),
+  };
+  await safePublishOrderEvent({ orderId: payload.orderId, status: 'retrying', ...retryPayload });
+  try {
+    await prisma.orderEvent.create({
+      data: {
+        orderId: payload.orderId,
+        status: 'retrying',
+        payload: retryPayload as Prisma.InputJsonValue,
+      },
+    });
+  } catch (err) {
+    logger.warn({ err, orderId: payload.orderId }, 'Failed to persist retry audit row');
+  }
+}
+
 async function setStatus(
   orderId: string,
   status: string,
@@ -106,7 +153,7 @@ async function setStatus(
 ) {
   const payloadData = payload ?? {};
   const hasPayload = Object.keys(payloadData).length > 0;
-  await publishOrderEvent({ orderId, status, ts: Date.now(), ...(hasPayload ? payloadData : {}) });
+  await safePublishOrderEvent({ orderId, status, ts: Date.now(), ...(hasPayload ? payloadData : {}) });
   const eventData: Prisma.OrderEventUncheckedCreateInput = hasPayload
     ? { orderId, status, payload: payloadData as Prisma.InputJsonValue }
     : { orderId, status };
@@ -123,7 +170,18 @@ export function startWorker(opts?: { connection?: IORedis; concurrency?: number;
   });
   worker.on('failed', async (job: any, err: any) => {
     if (!job) return;
-    const orderId = job.data.orderId;
+    const orderId = job.data?.orderId;
+    if (!orderId) return;
+    const attemptsMade = typeof job.attemptsMade === 'number' ? job.attemptsMade : 0;
+    const maxAttempts = typeof job.opts?.attempts === 'number' ? job.opts.attempts : 1;
+    const fatal = err instanceof FatalOrderError;
+    const exhaustedAttempts = attemptsMade >= maxAttempts;
+
+    if (!fatal && !exhaustedAttempts) {
+      await recordRetryAttempt({ orderId, attemptsMade, maxAttempts, error: err });
+      return;
+    }
+
     const ord = await prisma.order.findUnique({ where: { id: orderId } });
     if (ord && ord.status !== 'confirmed' && ord.status !== 'failed') {
       const reason = err?.message || 'UNKNOWN_ERROR';

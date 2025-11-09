@@ -17,7 +17,9 @@
     "migrate:deploy": "prisma migrate deploy",
     "postinstall": "prisma generate",
     "ws": "tsx tools/ws-client.ts",
-    "ws:node": "node tools/ws-client.js"
+    "ws:node": "node tools/ws-client.js",
+    "burst": "tsx tools/burst-orders.ts",
+    "ws:multi": "tsx tools/ws-multi.ts"
   },
   "keywords": [],
   "author": "",
@@ -32,6 +34,7 @@
     "bullmq": "^5.63.0",
     "fastify": "^5.6.1",
     "ioredis": "^5.8.2",
+    "node-fetch": "^2.7.0",
     "pg": "^8.16.3",
     "pino": "^10.1.0",
     "pino-pretty": "^13.1.2",
@@ -43,6 +46,7 @@
   "devDependencies": {
     "@types/jest": "^30.0.0",
     "@types/node": "^24.10.0",
+    "@types/node-fetch": "^2.6.11",
     "@types/supertest": "^6.0.3",
     "@types/ws": "^8.18.1",
     "jest": "^30.2.0",

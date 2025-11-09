@@ -3,6 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.FatalOrderError = void 0;
 exports.createHandler = createHandler;
 exports.startWorker = startWorker;
 const bullmq_1 = require("bullmq");
@@ -21,6 +22,7 @@ class FatalOrderError extends Error {
         this.name = 'FatalOrderError';
     }
 }
+exports.FatalOrderError = FatalOrderError;
 function createHandler(router = new MockDexRouter_1.MockDexRouter()) {
     return async function handleJob(job) {
         const { orderId, tokenIn, tokenOut, amount, slippageBps } = job.data;
@@ -33,11 +35,25 @@ function createHandler(router = new MockDexRouter_1.MockDexRouter()) {
         const out1 = amount * ray.price * (1 - ray.fee);
         const out2 = amount * met.price * (1 - met.fee);
         const best = out1 >= out2 ? ray : met;
+        const routingDecision = {
+            orderId,
+            tokenIn,
+            tokenOut,
+            amount,
+            slippageBps,
+            candidates: [
+                { dex: ray.dex, price: ray.price, fee: ray.fee, estimatedOut: out1 },
+                { dex: met.dex, price: met.price, fee: met.fee, estimatedOut: out2 },
+            ],
+            selected: { dex: best.dex, price: best.price, fee: best.fee, estimatedOut: Math.max(out1, out2) },
+        };
+        logger_1.logger.info(routingDecision, 'DEX routing decision');
+        console.log('[dex-routing]', routingDecision);
         await db_1.prisma.order.update({ where: { id: orderId }, data: { routeDex: best.dex } });
         // 1.5) Mock wrapped SOL branch (no-op but testable)
         const needsWrap = tokenIn.toUpperCase() === 'SOL' && tokenOut.toUpperCase() !== 'SOL';
         if (needsWrap) {
-            await (0, pubsub_1.publishOrderEvent)({ orderId, status: 'pending', detail: { wrappedSol: true }, ts: Date.now() });
+            await safePublishOrderEvent({ orderId, status: 'pending', detail: { wrappedSol: true }, ts: Date.now() });
         }
         // 2) BUILDING
         await setStatus(orderId, 'building', { route: { dex: best.dex, expectedPrice: best.price, fee: best.fee } });
@@ -61,7 +77,7 @@ function createHandler(router = new MockDexRouter_1.MockDexRouter()) {
             where: { id: orderId },
             data: { executedPrice, amountOut: amountOutFinal, txHash, status: 'confirmed' },
         });
-        await (0, pubsub_1.publishOrderEvent)({
+        await safePublishOrderEvent({
             orderId,
             status: 'confirmed',
             txHash,
@@ -83,10 +99,38 @@ function createHandler(router = new MockDexRouter_1.MockDexRouter()) {
         return true;
     };
 }
+async function safePublishOrderEvent(evt) {
+    try {
+        await (0, pubsub_1.publishOrderEvent)(evt);
+    }
+    catch (err) {
+        logger_1.logger.warn({ err, orderId: evt?.orderId }, 'Failed to publish order event');
+    }
+}
+async function recordRetryAttempt(payload) {
+    const retryPayload = {
+        error: payload.error?.message || 'UNKNOWN_ERROR',
+        attempt: payload.attemptsMade,
+        remainingAttempts: Math.max(payload.maxAttempts - payload.attemptsMade, 0),
+    };
+    await safePublishOrderEvent({ orderId: payload.orderId, status: 'retrying', ...retryPayload });
+    try {
+        await db_1.prisma.orderEvent.create({
+            data: {
+                orderId: payload.orderId,
+                status: 'retrying',
+                payload: retryPayload,
+            },
+        });
+    }
+    catch (err) {
+        logger_1.logger.warn({ err, orderId: payload.orderId }, 'Failed to persist retry audit row');
+    }
+}
 async function setStatus(orderId, status, payload = {}, orderData = {}) {
     const payloadData = payload ?? {};
     const hasPayload = Object.keys(payloadData).length > 0;
-    await (0, pubsub_1.publishOrderEvent)({ orderId, status, ts: Date.now(), ...(hasPayload ? payloadData : {}) });
+    await safePublishOrderEvent({ orderId, status, ts: Date.now(), ...(hasPayload ? payloadData : {}) });
     const eventData = hasPayload
         ? { orderId, status, payload: payloadData }
         : { orderId, status };
@@ -103,7 +147,17 @@ function startWorker(opts) {
     worker.on('failed', async (job, err) => {
         if (!job)
             return;
-        const orderId = job.data.orderId;
+        const orderId = job.data?.orderId;
+        if (!orderId)
+            return;
+        const attemptsMade = typeof job.attemptsMade === 'number' ? job.attemptsMade : 0;
+        const maxAttempts = typeof job.opts?.attempts === 'number' ? job.opts.attempts : 1;
+        const fatal = err instanceof FatalOrderError;
+        const exhaustedAttempts = attemptsMade >= maxAttempts;
+        if (!fatal && !exhaustedAttempts) {
+            await recordRetryAttempt({ orderId, attemptsMade, maxAttempts, error: err });
+            return;
+        }
         const ord = await db_1.prisma.order.findUnique({ where: { id: orderId } });
         if (ord && ord.status !== 'confirmed' && ord.status !== 'failed') {
             const reason = err?.message || 'UNKNOWN_ERROR';

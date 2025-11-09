@@ -83,7 +83,7 @@ const OrderDetailResponse = {
             id: { type: 'string' },
             orderId: { type: 'string' },
             status: { type: 'string' },
-            payload: { type: 'object', nullable: true },
+            payload: { type: 'object', nullable: true, additionalProperties: true },
             createdAt: { type: 'string', format: 'date-time' },
           },
           required: ['id', 'orderId', 'status', 'createdAt'],
@@ -204,7 +204,8 @@ export async function registerRoutes(app: FastifyInstance) {
           .send({ error: 'rate_limited', message: `API limit ${gate.limit}/min exceeded`, currentCount: gate.count });
       }
       const slippageBps = body.slippageBps ?? CONFIG.DEFAULT_SLIPPAGE_BPS;
-      const idemKey = String(req.headers['x-idempotency-key'] || '');
+      const idemHeader = req.headers['x-idempotency-key'] ?? req.headers['clienttoken'] ?? req.headers['client-token'];
+      const idemKey = idemHeader ? String(idemHeader) : '';
       if (idemKey) {
         const existing = await getOrSetIdempotency(idemKey);
         if (existing) {
