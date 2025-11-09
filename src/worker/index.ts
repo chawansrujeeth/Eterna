@@ -6,7 +6,10 @@ import { publishOrderEvent } from '../lib/pubsub';
 import { MockDexRouter, sleep } from '../dex/MockDexRouter';
 import { bpsDelta } from '../lib/math';
 
-const defaultConnection = () => new IORedis(process.env.REDIS_URL || 'redis://localhost:6379');
+const defaultConnection = () =>
+  new IORedis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    maxRetriesPerRequest: null,
+  });
 
 type ExecuteData = {
   orderId: string;
