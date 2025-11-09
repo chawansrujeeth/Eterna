@@ -14,7 +14,11 @@
       "_type": "environment",
       "parentId": "wrk_order_engine",
       "name": "Base Environment",
-      "data": { "baseUrl": "http://localhost:3000", "wsBase": "ws://localhost:3000", "orderId": "" }
+      "data": {
+        "baseUrl": "http://localhost:3000",
+        "wsBase": "ws://localhost:3000",
+        "orderId": ""
+      }
     },
     {
       "_id": "req_http_create",
@@ -35,6 +39,15 @@
       "name": "WS /api/orders/execute?orderId={{ orderId }}",
       "url": "{{ wsBase }}/api/orders/execute?orderId={{ orderId }}",
       "metaSortKey": -1
+    },
+    {
+      "_id": "req_http_get_order",
+      "_type": "request",
+      "parentId": "wrk_order_engine",
+      "name": "GET /api/orders/:orderId",
+      "method": "GET",
+      "url": "{{ baseUrl }}/api/orders/{{ orderId }}",
+      "metaSortKey": -0.5
     }
   ]
 }

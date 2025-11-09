@@ -15,6 +15,12 @@ const math_1 = require("../lib/math");
 const defaultConnection = () => new ioredis_1.default(process.env.REDIS_URL || 'redis://localhost:6379', {
     maxRetriesPerRequest: null,
 });
+class FatalOrderError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'FatalOrderError';
+    }
+}
 function createHandler(router = new MockDexRouter_1.MockDexRouter()) {
     return async function handleJob(job) {
         const { orderId, tokenIn, tokenOut, amount, slippageBps } = job.data;
@@ -44,13 +50,17 @@ function createHandler(router = new MockDexRouter_1.MockDexRouter()) {
         const usedBps = Math.round((0, math_1.bpsDelta)(executedPrice, best.price));
         if (usedBps > slippageBps) {
             const reason = `SLIPPAGE_EXCEEDED: used ${usedBps} bps > allowed ${slippageBps} bps`;
-            await db_1.prisma.order.update({ where: { id: orderId }, data: { failureReason: reason } });
-            await (0, pubsub_1.publishOrderEvent)({ orderId, status: 'failed', error: reason, ts: Date.now(), lastStep: 'submitted' });
-            await db_1.prisma.orderEvent.create({ data: { orderId, status: 'failed', payload: { error: reason, lastStep: 'submitted' } } });
-            throw new Error(reason);
+            await setStatus(orderId, 'failed', { error: reason, lastStep: 'submitted' }, { failureReason: reason });
+            if (typeof job.discard === 'function') {
+                await job.discard();
+            }
+            throw new FatalOrderError(reason);
         }
         const amountOutFinal = amount * executedPrice * (1 - best.fee);
-        await db_1.prisma.order.update({ where: { id: orderId }, data: { executedPrice, amountOut: amountOutFinal, txHash } });
+        await db_1.prisma.order.update({
+            where: { id: orderId },
+            data: { executedPrice, amountOut: amountOutFinal, txHash, status: 'confirmed' },
+        });
         await (0, pubsub_1.publishOrderEvent)({
             orderId,
             status: 'confirmed',
@@ -73,10 +83,15 @@ function createHandler(router = new MockDexRouter_1.MockDexRouter()) {
         return true;
     };
 }
-async function setStatus(orderId, status, payload = {}) {
-    await (0, pubsub_1.publishOrderEvent)({ orderId, status, ts: Date.now(), ...payload });
-    await db_1.prisma.orderEvent.create({ data: { orderId, status, payload } });
-    await db_1.prisma.order.update({ where: { id: orderId }, data: { status } });
+async function setStatus(orderId, status, payload = {}, orderData = {}) {
+    const payloadData = payload ?? {};
+    const hasPayload = Object.keys(payloadData).length > 0;
+    await (0, pubsub_1.publishOrderEvent)({ orderId, status, ts: Date.now(), ...(hasPayload ? payloadData : {}) });
+    const eventData = hasPayload
+        ? { orderId, status, payload: payloadData }
+        : { orderId, status };
+    await db_1.prisma.orderEvent.create({ data: eventData });
+    await db_1.prisma.order.update({ where: { id: orderId }, data: { status, ...orderData } });
 }
 function startWorker(opts) {
     const connection = opts?.connection ?? defaultConnection();
@@ -90,11 +105,9 @@ function startWorker(opts) {
             return;
         const orderId = job.data.orderId;
         const ord = await db_1.prisma.order.findUnique({ where: { id: orderId } });
-        if (ord && ord.status !== 'confirmed') {
+        if (ord && ord.status !== 'confirmed' && ord.status !== 'failed') {
             const reason = err?.message || 'UNKNOWN_ERROR';
-            await db_1.prisma.order.update({ where: { id: orderId }, data: { status: 'failed', failureReason: reason } });
-            await (0, pubsub_1.publishOrderEvent)({ orderId, status: 'failed', error: reason, ts: Date.now(), lastStep: ord?.status });
-            await db_1.prisma.orderEvent.create({ data: { orderId, status: 'failed', payload: { error: reason, lastStep: ord?.status } } });
+            await setStatus(orderId, 'failed', { error: reason, lastStep: ord?.status }, { failureReason: reason });
         }
     });
     return worker;

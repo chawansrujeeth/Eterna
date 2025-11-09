@@ -11,9 +11,22 @@
       "request": {
         "method": "POST",
         "header": [
-          { "key": "Content-Type", "value": "application/json" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
         ],
-        "url": { "raw": "{{baseUrl}}/api/orders/execute", "host": ["{{baseUrl}}"], "path": ["api", "orders", "execute"] },
+        "url": {
+          "raw": "{{baseUrl}}/api/orders/execute",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "orders",
+            "execute"
+          ]
+        },
         "body": {
           "mode": "raw",
           "raw": "{\n  \"orderType\":\"market\",\n  \"tokenIn\":\"SOL\",\n  \"tokenOut\":\"USDC\",\n  \"amount\": 1.25,\n  \"slippageBps\": 50\n}"
@@ -38,10 +51,36 @@
           }
         }
       ]
+    },
+    {
+      "name": "Get Order Details",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/orders/{{orderId}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "api",
+            "orders",
+            "{{orderId}}"
+          ]
+        },
+        "description": "Fetch the persisted order plus event history using the orderId captured from the Create Market Order request."
+      },
+      "response": []
     }
   ],
   "variable": [
-    { "key": "baseUrl", "value": "http://localhost:3000" },
-    { "key": "orderId", "value": "" }
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000"
+    },
+    {
+      "key": "orderId",
+      "value": ""
+    }
   ]
 }

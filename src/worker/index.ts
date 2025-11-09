@@ -1,5 +1,6 @@
 import { Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
+import type { Prisma } from '@prisma/client';
 import { logger } from '../lib/logger';
 import { prisma } from '../lib/db';
 import { publishOrderEvent } from '../lib/pubsub';
@@ -19,6 +20,13 @@ type ExecuteData = {
   slippageBps: number;
   orderType: 'market';
 };
+
+class FatalOrderError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'FatalOrderError';
+  }
+}
 
 export function createHandler(router = new MockDexRouter()) {
   return async function handleJob(job: Job<ExecuteData>) {
@@ -55,14 +63,18 @@ export function createHandler(router = new MockDexRouter()) {
 
     if (usedBps > slippageBps) {
       const reason = `SLIPPAGE_EXCEEDED: used ${usedBps} bps > allowed ${slippageBps} bps`;
-      await prisma.order.update({ where: { id: orderId }, data: { failureReason: reason } });
-      await publishOrderEvent({ orderId, status: 'failed', error: reason, ts: Date.now(), lastStep: 'submitted' });
-      await prisma.orderEvent.create({ data: { orderId, status: 'failed', payload: { error: reason, lastStep: 'submitted' } } });
-      throw new Error(reason);
+      await setStatus(orderId, 'failed', { error: reason, lastStep: 'submitted' }, { failureReason: reason });
+      if (typeof job.discard === 'function') {
+        await job.discard();
+      }
+      throw new FatalOrderError(reason);
     }
 
     const amountOutFinal = amount * executedPrice * (1 - best.fee);
-    await prisma.order.update({ where: { id: orderId }, data: { executedPrice, amountOut: amountOutFinal, txHash } });
+    await prisma.order.update({
+      where: { id: orderId },
+      data: { executedPrice, amountOut: amountOutFinal, txHash, status: 'confirmed' },
+    });
     await publishOrderEvent({
       orderId,
       status: 'confirmed',
@@ -86,10 +98,20 @@ export function createHandler(router = new MockDexRouter()) {
   };
 }
 
-async function setStatus(orderId: string, status: string, payload: any = {}) {
-  await publishOrderEvent({ orderId, status, ts: Date.now(), ...payload });
-  await prisma.orderEvent.create({ data: { orderId, status, payload } });
-  await prisma.order.update({ where: { id: orderId }, data: { status } });
+async function setStatus(
+  orderId: string,
+  status: string,
+  payload: Record<string, any> = {},
+  orderData: Record<string, any> = {},
+) {
+  const payloadData = payload ?? {};
+  const hasPayload = Object.keys(payloadData).length > 0;
+  await publishOrderEvent({ orderId, status, ts: Date.now(), ...(hasPayload ? payloadData : {}) });
+  const eventData: Prisma.OrderEventUncheckedCreateInput = hasPayload
+    ? { orderId, status, payload: payloadData as Prisma.InputJsonValue }
+    : { orderId, status };
+  await prisma.orderEvent.create({ data: eventData });
+  await prisma.order.update({ where: { id: orderId }, data: { status, ...orderData } });
 }
 
 export function startWorker(opts?: { connection?: IORedis; concurrency?: number; handler?: ReturnType<typeof createHandler> }) {
@@ -103,11 +125,9 @@ export function startWorker(opts?: { connection?: IORedis; concurrency?: number;
     if (!job) return;
     const orderId = job.data.orderId;
     const ord = await prisma.order.findUnique({ where: { id: orderId } });
-    if (ord && ord.status !== 'confirmed') {
+    if (ord && ord.status !== 'confirmed' && ord.status !== 'failed') {
       const reason = err?.message || 'UNKNOWN_ERROR';
-      await prisma.order.update({ where: { id: orderId }, data: { status: 'failed', failureReason: reason } });
-      await publishOrderEvent({ orderId, status: 'failed', error: reason, ts: Date.now(), lastStep: ord?.status });
-      await prisma.orderEvent.create({ data: { orderId, status: 'failed', payload: { error: reason, lastStep: ord?.status } } });
+      await setStatus(orderId, 'failed', { error: reason, lastStep: ord?.status }, { failureReason: reason });
     }
   });
   return worker;

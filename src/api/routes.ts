@@ -50,6 +50,57 @@ const CreateOrderResponse = {
   },
 } as const;
 
+const OrderDetailResponse = {
+  200: {
+    description: 'Order with historical events',
+    type: 'object',
+    properties: {
+      order: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          type: { type: 'string' },
+          tokenIn: { type: 'string' },
+          tokenOut: { type: 'string' },
+          amount: { type: 'number' },
+          slippageBps: { type: 'integer' },
+          status: { type: 'string' },
+          routeDex: { type: 'string', nullable: true },
+          executedPrice: { type: 'number', nullable: true },
+          amountOut: { type: 'number', nullable: true },
+          txHash: { type: 'string', nullable: true },
+          failureReason: { type: 'string', nullable: true },
+          createdAt: { type: 'string', format: 'date-time' },
+          updatedAt: { type: 'string', format: 'date-time' },
+        },
+        required: ['id', 'type', 'tokenIn', 'tokenOut', 'amount', 'slippageBps', 'status', 'createdAt', 'updatedAt'],
+      },
+      events: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            orderId: { type: 'string' },
+            status: { type: 'string' },
+            payload: { type: 'object', nullable: true },
+            createdAt: { type: 'string', format: 'date-time' },
+          },
+          required: ['id', 'orderId', 'status', 'createdAt'],
+        },
+      },
+    },
+  },
+  404: {
+    description: 'Order missing',
+    type: 'object',
+    properties: {
+      error: { type: 'string', example: 'not_found' },
+      message: { type: 'string' },
+    },
+  },
+} as const;
+
 const bodySchema = z.object({
   orderType: z.literal('market'),
   tokenIn: z.string().min(1),
@@ -58,11 +109,75 @@ const bodySchema = z.object({
   slippageBps: z.number().int().min(1).max(10_000).optional(),
 });
 
+async function replayLatestOrderSnapshot(orderId: string) {
+  const [lastEvent, order] = await Promise.all([
+    prisma.orderEvent.findFirst({ where: { orderId }, orderBy: { createdAt: 'desc' } }),
+    prisma.order.findUnique({ where: { id: orderId }, select: { status: true } }),
+  ]);
+
+  if (lastEvent) {
+    await publishOrderEvent({
+      orderId,
+      status: lastEvent.status,
+      payload: lastEvent.payload ?? undefined,
+      ts: lastEvent.createdAt.getTime(),
+      replay: true,
+    });
+    return;
+  }
+
+  if (order) {
+    await publishOrderEvent({ orderId, status: order.status, ts: Date.now(), replay: true });
+  }
+}
+
 export async function registerRoutes(app: FastifyInstance) {
   // WebSocket endpoint on same path (GET)
   app.get('/api/orders/execute', { websocket: true }, (conn, req) => {
     handleOrderWebSocket(conn, req);
   });
+
+  app.get<{ Params: { orderId: string } }>(
+    '/api/orders/:orderId',
+    {
+      schema: {
+        tags: ['orders'],
+        summary: 'Fetch order details',
+        params: {
+          type: 'object',
+          required: ['orderId'],
+          properties: {
+            orderId: { type: 'string', description: 'Order identifier' },
+          },
+        },
+        response: OrderDetailResponse,
+      },
+    },
+    async (req, reply) => {
+      const { orderId } = req.params;
+      const order = await prisma.order.findUnique({ where: { id: orderId } });
+      if (!order) {
+        return reply.code(404).send({ error: 'not_found', message: 'Order not found' });
+      }
+
+      const events = await prisma.orderEvent.findMany({ where: { orderId }, orderBy: { createdAt: 'asc' } });
+
+      return reply.send({
+        order: {
+          ...order,
+          createdAt: order.createdAt.toISOString(),
+          updatedAt: order.updatedAt.toISOString(),
+        },
+        events: events.map((evt) => ({
+          id: evt.id,
+          orderId: evt.orderId,
+          status: evt.status,
+          payload: evt.payload ?? null,
+          createdAt: evt.createdAt.toISOString(),
+        })),
+      });
+    },
+  );
 
   // HTTP submit endpoint (POST)
   app.post(
@@ -82,64 +197,63 @@ export async function registerRoutes(app: FastifyInstance) {
         return reply.code(400).send({ error: 'invalid_body', details: parsed.error.issues });
       }
       const body = parsed.data;
-    const gate = await allowOrderCreate();
-    if (!gate.allowed) {
-      return reply
-        .code(429)
-        .send({ error: 'rate_limited', message: `API limit ${gate.limit}/min exceeded`, currentCount: gate.count });
-    }
-    const slippageBps = body.slippageBps ?? CONFIG.DEFAULT_SLIPPAGE_BPS;
-    const idemKey = String(req.headers['x-idempotency-key'] || '');
-    if (idemKey) {
-      const existing = await getOrSetIdempotency(idemKey);
-      if (existing) {
-        // Re-emit pending so the client WS still sees something if they reconnect
-        await publishOrderEvent({ orderId: existing, status: 'pending' });
-        return reply.code(200).send({ orderId: existing, idempotent: true });
+      const gate = await allowOrderCreate();
+      if (!gate.allowed) {
+        return reply
+          .code(429)
+          .send({ error: 'rate_limited', message: `API limit ${gate.limit}/min exceeded`, currentCount: gate.count });
       }
-    }
+      const slippageBps = body.slippageBps ?? CONFIG.DEFAULT_SLIPPAGE_BPS;
+      const idemKey = String(req.headers['x-idempotency-key'] || '');
+      if (idemKey) {
+        const existing = await getOrSetIdempotency(idemKey);
+        if (existing) {
+          await replayLatestOrderSnapshot(existing);
+          return reply.code(200).send({ orderId: existing, idempotent: true });
+        }
+      }
 
-    // create order row
-    const orderId = randomUUID();
-    await prisma.order.create({
-      data: {
-        id: orderId,
-        type: body.orderType,
+      // create order row
+      const orderId = randomUUID();
+      await prisma.order.create({
+        data: {
+          id: orderId,
+          type: body.orderType,
+          tokenIn: body.tokenIn,
+          tokenOut: body.tokenOut,
+          amount: body.amount,
+          slippageBps,
+          status: 'pending',
+        },
+      });
+      if (idemKey) {
+        await getOrSetIdempotency(idemKey, orderId);
+      }
+
+      // enqueue job for worker
+      await ordersQueue.add('execute', {
+        orderId,
         tokenIn: body.tokenIn,
         tokenOut: body.tokenOut,
         amount: body.amount,
         slippageBps,
-        status: 'pending',
-      },
-    });
-    if (idemKey) {
-      await getOrSetIdempotency(idemKey, orderId);
-    }
+        orderType: body.orderType,
+      });
 
-    // enqueue job for worker
-    await ordersQueue.add('execute', {
-      orderId,
-      tokenIn: body.tokenIn,
-      tokenOut: body.tokenOut,
-      amount: body.amount,
-      slippageBps,
-      orderType: body.orderType,
-    });
+      // emit first event
+      await publishOrderEvent({ orderId, status: 'pending' });
 
-    // emit first event
-    await publishOrderEvent({ orderId, status: 'pending' });
+      // Persist the event row (nice to have)
+      await prisma.orderEvent.create({
+        data: {
+          orderId,
+          status: 'pending',
+          payload: { source: 'api' },
+        },
+      });
 
-    // Persist the event row (nice to have)
-    await prisma.orderEvent.create({
-      data: {
-        orderId,
-        status: 'pending',
-        payload: { source: 'api' },
-      },
-    });
-
-    // return orderId to client
-    return reply.code(200).send({ orderId });
+      // return orderId to client
+      return reply.code(200).send({ orderId, idempotent: false });
     }
   );
 }

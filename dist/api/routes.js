@@ -49,6 +49,56 @@ const CreateOrderResponse = {
         },
     },
 };
+const OrderDetailResponse = {
+    200: {
+        description: 'Order with historical events',
+        type: 'object',
+        properties: {
+            order: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string' },
+                    type: { type: 'string' },
+                    tokenIn: { type: 'string' },
+                    tokenOut: { type: 'string' },
+                    amount: { type: 'number' },
+                    slippageBps: { type: 'integer' },
+                    status: { type: 'string' },
+                    routeDex: { type: 'string', nullable: true },
+                    executedPrice: { type: 'number', nullable: true },
+                    amountOut: { type: 'number', nullable: true },
+                    txHash: { type: 'string', nullable: true },
+                    failureReason: { type: 'string', nullable: true },
+                    createdAt: { type: 'string', format: 'date-time' },
+                    updatedAt: { type: 'string', format: 'date-time' },
+                },
+                required: ['id', 'type', 'tokenIn', 'tokenOut', 'amount', 'slippageBps', 'status', 'createdAt', 'updatedAt'],
+            },
+            events: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    properties: {
+                        id: { type: 'string' },
+                        orderId: { type: 'string' },
+                        status: { type: 'string' },
+                        payload: { type: 'object', nullable: true },
+                        createdAt: { type: 'string', format: 'date-time' },
+                    },
+                    required: ['id', 'orderId', 'status', 'createdAt'],
+                },
+            },
+        },
+    },
+    404: {
+        description: 'Order missing',
+        type: 'object',
+        properties: {
+            error: { type: 'string', example: 'not_found' },
+            message: { type: 'string' },
+        },
+    },
+};
 const bodySchema = zod_1.z.object({
     orderType: zod_1.z.literal('market'),
     tokenIn: zod_1.z.string().min(1),
@@ -56,10 +106,64 @@ const bodySchema = zod_1.z.object({
     amount: zod_1.z.number().positive(),
     slippageBps: zod_1.z.number().int().min(1).max(10000).optional(),
 });
+async function replayLatestOrderSnapshot(orderId) {
+    const [lastEvent, order] = await Promise.all([
+        db_1.prisma.orderEvent.findFirst({ where: { orderId }, orderBy: { createdAt: 'desc' } }),
+        db_1.prisma.order.findUnique({ where: { id: orderId }, select: { status: true } }),
+    ]);
+    if (lastEvent) {
+        await (0, pubsub_1.publishOrderEvent)({
+            orderId,
+            status: lastEvent.status,
+            payload: lastEvent.payload ?? undefined,
+            ts: lastEvent.createdAt.getTime(),
+            replay: true,
+        });
+        return;
+    }
+    if (order) {
+        await (0, pubsub_1.publishOrderEvent)({ orderId, status: order.status, ts: Date.now(), replay: true });
+    }
+}
 async function registerRoutes(app) {
     // WebSocket endpoint on same path (GET)
     app.get('/api/orders/execute', { websocket: true }, (conn, req) => {
         (0, ws_1.handleOrderWebSocket)(conn, req);
+    });
+    app.get('/api/orders/:orderId', {
+        schema: {
+            tags: ['orders'],
+            summary: 'Fetch order details',
+            params: {
+                type: 'object',
+                required: ['orderId'],
+                properties: {
+                    orderId: { type: 'string', description: 'Order identifier' },
+                },
+            },
+            response: OrderDetailResponse,
+        },
+    }, async (req, reply) => {
+        const { orderId } = req.params;
+        const order = await db_1.prisma.order.findUnique({ where: { id: orderId } });
+        if (!order) {
+            return reply.code(404).send({ error: 'not_found', message: 'Order not found' });
+        }
+        const events = await db_1.prisma.orderEvent.findMany({ where: { orderId }, orderBy: { createdAt: 'asc' } });
+        return reply.send({
+            order: {
+                ...order,
+                createdAt: order.createdAt.toISOString(),
+                updatedAt: order.updatedAt.toISOString(),
+            },
+            events: events.map((evt) => ({
+                id: evt.id,
+                orderId: evt.orderId,
+                status: evt.status,
+                payload: evt.payload ?? null,
+                createdAt: evt.createdAt.toISOString(),
+            })),
+        });
     });
     // HTTP submit endpoint (POST)
     app.post('/api/orders/execute', {
@@ -87,8 +191,7 @@ async function registerRoutes(app) {
         if (idemKey) {
             const existing = await (0, idempotency_1.getOrSetIdempotency)(idemKey);
             if (existing) {
-                // Re-emit pending so the client WS still sees something if they reconnect
-                await (0, pubsub_1.publishOrderEvent)({ orderId: existing, status: 'pending' });
+                await replayLatestOrderSnapshot(existing);
                 return reply.code(200).send({ orderId: existing, idempotent: true });
             }
         }
@@ -128,6 +231,6 @@ async function registerRoutes(app) {
             },
         });
         // return orderId to client
-        return reply.code(200).send({ orderId });
+        return reply.code(200).send({ orderId, idempotent: false });
     });
 }

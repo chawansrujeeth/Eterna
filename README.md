@@ -4,3 +4,4 @@
 - For WebSocket streaming, either:
   - In **Insomnia**, import **insomnia_collection.json**, run POST, copy the `orderId` into env, then start the WS request.
   - Or run: `npm run ws -- <orderId>`.
+- To inspect the saved record without the WebSocket, call `GET /api/orders/{orderId}` (available in Swagger) after the POST completes.

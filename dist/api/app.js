@@ -21,10 +21,15 @@ async function createApp() {
         }
     });
     await app.register(cors_1.default, { origin: true });
+    const swaggerServers = [{ url: '/' }];
+    if (process.env.NODE_ENV !== 'production') {
+        const localPort = process.env.PORT || '3000';
+        swaggerServers.push({ url: `http://localhost:${localPort}` });
+    }
     await app.register(swagger_1.default, {
         openapi: {
             info: { title: 'Order Execution Engine', version: '0.1.0' },
-            servers: [{ url: 'http://localhost:3000' }],
+            servers: swaggerServers,
             tags: [{ name: 'orders' }]
         }
     });
